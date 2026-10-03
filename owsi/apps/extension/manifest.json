@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "OWSI — OMEGA Web Security Interceptor",
+  "version": "1.0.0",
+  "description": "Browser control surface for the local OWSI security testing engine: proxy toggle, interception, traffic forwarding, dashboard.",
+  "permissions": [
+    "proxy",
+    "tabs",
+    "webRequest",
+    "storage",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:9000/*",
+    "ws://127.0.0.1:9000/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "OWSI",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "devtools_page": "devtools.html",
+  "minimum_chrome_version": "111"
+}
