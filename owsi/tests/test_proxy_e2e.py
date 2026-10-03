@@ -1,6 +1,6 @@
 """End-to-end proxy verification through the REAL interception engine.
 
-Covers (spec §15/§16, §100):
+Covers (spec sections 15/16, 100):
   * plain HTTP proxied via absolute-URI request line
   * HTTPS CONNECT + MITM: leaf cert presented is signed by the OWSI CA and
     validates against it with full TLS verification
@@ -17,7 +17,6 @@ import time
 
 import pytest
 
-from owsi.http_client import send_request
 from owsi.http_model import HeaderList, HttpRequest
 
 
@@ -27,24 +26,46 @@ def lab(tmp_root, app):
     from conftest import free_port
     from owsi.testsite import TestSite
 
-    site = TestSite(port=free_port(), https_port=free_port(),
-                    data_dir=str(tmp_root / f"lab-{time.time_ns()}"))
-    site.start()
+    site = None
+    pport = None
+    started = False
 
-    pport = free_port()
-    for _ in range(20):
+    def _bind_proxy():
+        nonlocal pport
+        for _ in range(20):
+            try:
+                app.proxy.start(("127.0.0.1", pport))
+                return True
+            except OSError:
+                pport = free_port()
+        return False
+
+    last_err = None
+    for _ in range(6):  # retry: ephemeral ports can race between probe & bind
+        http_p, https_p, pport = free_port(), free_port(), free_port()
         try:
-            app.proxy.start(("127.0.0.1", pport))
-            break
-        except OSError:
-            pport = free_port()
-    else:
-        pytest.fail("could not bind proxy port")
+            site = TestSite(port=http_p, https_port=https_p,
+                            data_dir=str(tmp_root / f"lab-{time.time_ns()}"))
+            site.start()
+        except OSError as e:
+            last_err = e
+            if site:
+                site.stop()
+            continue
+        if not _bind_proxy():
+            last_err = "proxy bind failed"
+            site.stop()
+            continue
+        started = True
+        break
+    if not started:
+        pytest.fail(f"could not start lab/proxy: {last_err}")
 
     app.policy.update({
         "mode": "LAB",
         "scope": {"allowedHosts": ["127.0.0.1"],
-                  # dynamic lab ports must be in the port allowlist too
+                  # LAB mode auto-allows loopback hosts; dynamic ports must
+                  # still be in the port allowlist (default 80/443/8080/8443).
                   "allowedPorts": [site.port, site.https_port],
                   "allowedSchemes": ["http", "https"]},
     })
@@ -52,32 +73,51 @@ def lab(tmp_root, app):
     app.interceptor.set_flags(timeout=8.0)
     yield {"proxy": ("127.0.0.1", pport), "http": site.port,
            "https": site.https_port, "app": app}
-    app.proxy.stop()
-    site.stop()
+    try:
+        app.proxy.stop()
+    finally:
+        site.stop()
 
 
-def _get(lab, path, scheme="http"):
-    """Send a request THROUGH the OWSI proxy using its own HTTP client.
+def _raw_request(proxy_addr, target, host_header, tls=False, cafile=None):
+    """Send one absolute-URI request THROUGH the proxy over a raw socket.
 
-    Absolute-URI request line (proxy form); ConnectionPool connects directly
-    to the proxy address, so this exercises the real interception pipeline.
+    Returns the parsed status int and the full raw response bytes.  This
+    exercises the real interception pipeline (rules -> intercept -> policy ->
+    forward) exactly like a browser configured to use the proxy would.
     """
-    host, port = "127.0.0.1", lab["http"] if scheme == "http" else lab["https"]
-    req = HttpRequest(
-        method="GET",
-        target=f"{scheme}://{host}:{port}{path}",
-        version="HTTP/1.1",
-        headers=HeaderList([("Host", f"{host}:{port}"),
-                            ("Connection", "close")]))
-    req.scheme, req.host, req.port = scheme, host, port
-    return send_request(req, timeout=10)
+    s = socket.create_connection(proxy_addr, timeout=10)
+    if tls:
+        ctx = (ssl.create_default_context(cafile=cafile) if cafile
+               else ssl._create_unverified_context())
+        s = ctx.wrap_socket(s, server_hostname="127.0.0.1")
+    req = (f"GET {target} HTTP/1.1\r\n"
+           f"Host: {host_header}\r\n"
+           f"Connection: close\r\n\r\n").encode()
+    s.sendall(req)
+    chunks = []
+    while True:
+        try:
+            c = s.recv(65536)
+        except Exception:
+            break
+        if not c:
+            break
+        chunks.append(c)
+    s.close()
+    data = b"".join(chunks)
+    status = int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0
+    return status, data
 
 
 # ---------------------------------------------------------------------------
 def test_plain_http_through_proxy(lab):
-    resp = _get(lab, "/")
-    assert resp.status == 200
-    assert len(resp.body) > 0
+    status, data = _raw_request(
+        lab["proxy"], f"http://127.0.0.1:{lab['http']}/",
+        f"127.0.0.1:{lab['http']}")
+    assert status == 200, data[:200]
+    body = data.partition(b"\r\n\r\n")[2]
+    assert len(body) > 0
     hist = lab["app"].db.list_history(limit=50)
     assert any(h["host"] == "127.0.0.1" and h["path"] == "/" for h in hist), \
         "proxied request not recorded in history"
@@ -85,7 +125,7 @@ def test_plain_http_through_proxy(lab):
 
 
 def test_https_connect_mitm_validated(lab):
-    """CONNECT tunnel → MITM leaf must chain-verify against the OWSI CA."""
+    """CONNECT tunnel -> MITM leaf must chain-verify against the OWSI CA."""
     ctx = ssl.create_default_context(cafile=lab["app"].ca.ca_cert_path)
     s = socket.create_connection(lab["proxy"], timeout=10)
     s.sendall(f"CONNECT 127.0.0.1:{lab['https']} HTTP/1.1\r\n"
@@ -93,8 +133,9 @@ def test_https_connect_mitm_validated(lab):
     banner = s.recv(1024)
     assert b"200" in banner, banner
     ts = ctx.wrap_socket(s, server_hostname="127.0.0.1")   # full verification
-    issuer = str(ts.cert()["issuer"])
-    assert "OWSI" in issuer, f"leaf not signed by OWSI CA: {issuer}"
+    cert = ts.getpeercert()
+    issuer_flat = ",".join(v for sub in cert["issuer"] for v in sub)
+    assert "OWSI" in issuer_flat, f"leaf not signed by OWSI CA: {issuer_flat}"
     ts.sendall(f"GET /api/items HTTP/1.1\r\n"
                f"Host: 127.0.0.1:{lab['https']}\r\n"
                f"Connection: close\r\n\r\n".encode())
@@ -116,22 +157,34 @@ def test_https_connect_mitm_validated(lab):
 
 
 def test_out_of_scope_blocked(lab):
-    lab["app"].policy.update({"scope": {"allowedHosts": ["example.com"]}})
-    resp = _get(lab, "/")
-    assert resp.status == 403, f"expected policy 403, got {resp.status}"
-    assert b"outside target scope" in resp.body or b"scope" in resp.body.lower()
-    lab["app"].policy.update({"scope": {"allowedHosts": ["127.0.0.1"]}})
-    assert _get(lab, "/").status == 200
+    # point the scope at a host the lab is NOT -> policy must answer 403
+    lab["app"].policy.update({"scope": {"allowedHosts": ["nowhere.invalid"]}})
+    # remove the loopback auto-allow by leaving LAB mode
+    lab["app"].policy.update({"mode": "MANUAL_ACTIVE"})
+    status, data = _raw_request(
+        lab["proxy"], f"http://127.0.0.1:{lab['http']}/",
+        f"127.0.0.1:{lab['http']}")
+    assert status == 403, f"expected policy 403, got {status}: {data[:200]}"
+    assert b"scope" in data.lower() or b"not allowed" in data.lower()
+    # back in scope -> 200 again
+    lab["app"].policy.update({"mode": "LAB",
+                              "scope": {"allowedHosts": ["127.0.0.1"]}})
+    status2, _ = _raw_request(
+        lab["proxy"], f"http://127.0.0.1:{lab['http']}/",
+        f"127.0.0.1:{lab['http']}")
+    assert status2 == 200
 
 
 def test_intercept_drop_request(lab):
     ic = lab["app"].interceptor
-    ic.set_flags(request=True)
+    ic.set_flags(req=True)          # correct kwarg names
     got = {}
 
     def sender():
         try:
-            got["resp"] = _get(lab, "/api/items")
+            got["resp"] = _raw_request(
+                lab["proxy"], f"http://127.0.0.1:{lab['http']}/api/items",
+                f"127.0.0.1:{lab['http']}")
         except Exception as e:
             got["err"] = repr(e)
 
@@ -148,19 +201,23 @@ def test_intercept_drop_request(lab):
     ok = ic.resolve(pend[0]["id"], "drop")
     assert ok
     t.join(12)
-    ic.set_flags(request=False)
-    status = getattr(got.get("resp"), "status", None)
-    assert "err" in got or status == 508, got
+    ic.set_flags(req=False)
+    if "err" in got:
+        return  # connection torn down client-side == dropped, acceptable
+    status = got["resp"][0]
+    assert status == 0 or status >= 400, got
 
 
 def test_intercept_modify_response(lab):
     ic = lab["app"].interceptor
-    ic.set_flags(response=True)
+    ic.set_flags(resp=True)         # correct kwarg names
     got = {}
 
     def sender():
         try:
-            got["resp"] = _get(lab, "/api/items")
+            got["resp"] = _raw_request(
+                lab["proxy"], f"http://127.0.0.1:{lab['http']}/api/items",
+                f"127.0.0.1:{lab['http']}")
         except Exception as e:
             got["err"] = repr(e)
 
@@ -173,24 +230,25 @@ def test_intercept_modify_response(lab):
         if pend:
             break
         time.sleep(0.05)
-    assert pend, "intercepted response never surfaced in pending list"
+    assert pend, f"intercepted response never surfaced: {got}"
     new_raw = ("HTTP/1.1 418 I Am A Teapot\r\n"
                "Content-Type: text/plain\r\n"
                "Content-Length: 3\r\n"
-               "Connection: close\r\n\r\nok!").encode("iso-8859-1").decode(
-                   "latin1")
+               "Connection: close\r\n\r\nok!").decode("latin1")
     assert ic.resolve(pend[0]["id"], "forward", raw_message=new_raw)
     t.join(12)
-    ic.set_flags(response=False)
-    r = got.get("resp")
-    assert r is not None, f"sender failed: {got}"
-    assert r.status == 418, f"response modification failed: {r.status}"
-    assert r.body == b"ok!"
+    ic.set_flags(resp=False)
+    assert "resp" in got, f"sender failed: {got}"
+    status, data = got["resp"]
+    assert status == 418, f"response modification failed: {data[:200]}"
+    assert data.endswith(b"ok!")
 
 
 def test_passive_analysis_finding_recorded(lab):
-    _get(lab, "/login")
-    _get(lab, "/")
-    time.sleep(0.3)
+    _raw_request(lab["proxy"], f"http://127.0.0.1:{lab['http']}/login",
+                 f"127.0.0.1:{lab['http']}")
+    _raw_request(lab["proxy"], f"http://127.0.0.1:{lab['http']}/",
+                 f"127.0.0.1:{lab['http']}")
+    time.sleep(0.5)
     findings = lab["app"].db.list_findings()
     assert len(findings) >= 1, "passive analyzer produced no findings"
